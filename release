@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+NAMESPACE="${NAMESPACE:-biomap-os}"
+APP_NAME="${APP_NAME:-biomap-test-data-platform-portal-server}"
+CONTAINER_NAME="${CONTAINER_NAME:-portal-server}"
+MANIFEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFEST_PATH="${MANIFEST_PATH:-${MANIFEST_DIR}/deployment.yml}"
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-180s}"
+KEEP_OLD_REPLICAS="${KEEP_OLD_REPLICAS:-1}"
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+
+ACTIVE_SERVICE="${APP_NAME}"
+BLUE_DEPLOYMENT="${APP_NAME}-blue"
+GREEN_DEPLOYMENT="${APP_NAME}-green"
+BLUE_SERVICE="${APP_NAME}-blue"
+GREEN_SERVICE="${APP_NAME}-green"
+
+usage() {
+  cat <<USAGE
+Usage:
+  $(basename "$0") init
+  $(basename "$0") status
+  $(basename "$0") deploy --image <image[:tag]> [--color blue|green] [--replicas 1]
+  $(basename "$0") switch [--color blue|green]
+  $(basename "$0") rollback
+  $(basename "$0") preview-url [--color blue|green]
+
+Commands:
+  init        Apply the blue/green manifest.
+  status      Show active color, deployment images, and ready replicas.
+  deploy      Deploy a new image to the inactive color by default and wait until ready.
+  switch      Point the stable service to the target color.
+  rollback    Switch traffic back to the inactive color.
+  preview-url Print an in-cluster preview service DNS name.
+
+Environment variables:
+  NAMESPACE, APP_NAME, CONTAINER_NAME, MANIFEST_PATH, ROLLOUT_TIMEOUT,
+  KEEP_OLD_REPLICAS, KUBECTL_BIN
+USAGE
+}
+
+log() {
+  printf '[blue-green] %s\n' "$*"
+}
+
+require_bin() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+k() {
+  "${KUBECTL_BIN}" -n "${NAMESPACE}" "$@"
+}
+
+get_active_color() {
+  local color
+  color="$(k get svc "${ACTIVE_SERVICE}" -o jsonpath='{.spec.selector.track}' 2>/dev/null || true)"
+  if [[ "${color}" != "blue" && "${color}" != "green" ]]; then
+    color="blue"
+  fi
+  printf '%s\n' "${color}"
+}
+
+other_color() {
+  if [[ "$1" == "blue" ]]; then
+    printf 'green\n'
+  else
+    printf 'blue\n'
+  fi
+}
+
+deployment_for_color() {
+  if [[ "$1" == "blue" ]]; then
+    printf '%s\n' "${BLUE_DEPLOYMENT}"
+  else
+    printf '%s\n' "${GREEN_DEPLOYMENT}"
+  fi
+}
+
+service_for_color() {
+  if [[ "$1" == "blue" ]]; then
+    printf '%s\n' "${BLUE_SERVICE}"
+  else
+    printf '%s\n' "${GREEN_SERVICE}"
+  fi
+}
+
+get_image() {
+  local deployment="$1"
+  k get deployment "${deployment}" -o jsonpath="{.spec.template.spec.containers[?(@.name=='${CONTAINER_NAME}')].image}"
+}
+
+get_ready_replicas() {
+  local deployment="$1"
+  k get deployment "${deployment}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true
+}
+
+cmd_init() {
+  log "Applying ${MANIFEST_PATH}"
+  "${KUBECTL_BIN}" apply -f "${MANIFEST_PATH}"
+  log "Blue/green resources are ready"
+}
+
+cmd_status() {
+  local active inactive blue_image green_image blue_ready green_ready
+  active="$(get_active_color)"
+  inactive="$(other_color "${active}")"
+  blue_image="$(get_image "${BLUE_DEPLOYMENT}" 2>/dev/null || true)"
+  green_image="$(get_image "${GREEN_DEPLOYMENT}" 2>/dev/null || true)"
+  blue_ready="$(get_ready_replicas "${BLUE_DEPLOYMENT}")"
+  green_ready="$(get_ready_replicas "${GREEN_DEPLOYMENT}")"
+
+  cat <<STATUS
+namespace: ${NAMESPACE}
+active_color: ${active}
+inactive_color: ${inactive}
+${BLUE_DEPLOYMENT}: image=${blue_image:-N/A} ready=${blue_ready:-0}
+${GREEN_DEPLOYMENT}: image=${green_image:-N/A} ready=${green_ready:-0}
+active_service: ${ACTIVE_SERVICE}
+blue_preview: http://${BLUE_SERVICE}.${NAMESPACE}.svc.cluster.local:8080
+green_preview: http://${GREEN_SERVICE}.${NAMESPACE}.svc.cluster.local:8080
+STATUS
+}
+
+cmd_deploy() {
+  local image=""
+  local color=""
+  local replicas=1
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image)
+        image="$2"
+        shift 2
+        ;;
+      --color)
+        color="$2"
+        shift 2
+        ;;
+      --replicas)
+        replicas="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  [[ -n "${image}" ]] || {
+    echo "--image is required" >&2
+    exit 1
+  }
+
+  if [[ -z "${color}" ]]; then
+    color="$(other_color "$(get_active_color)")"
+  fi
+
+  if [[ "${color}" != "blue" && "${color}" != "green" ]]; then
+    echo "--color must be blue or green" >&2
+    exit 1
+  fi
+
+  local deployment
+  deployment="$(deployment_for_color "${color}")"
+
+  log "Deploying ${image} to ${deployment}"
+  k scale deployment "${deployment}" --replicas="${replicas}"
+  k set image deployment/"${deployment}" "${CONTAINER_NAME}=${image}"
+  k rollout status deployment/"${deployment}" --timeout="${ROLLOUT_TIMEOUT}"
+  log "Preview is ready at http://$(service_for_color "${color}").${NAMESPACE}.svc.cluster.local:8080"
+}
+
+cmd_switch() {
+  local color=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --color)
+        color="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "${color}" ]]; then
+    color="$(other_color "$(get_active_color)")"
+  fi
+
+  if [[ "${color}" != "blue" && "${color}" != "green" ]]; then
+    echo "--color must be blue or green" >&2
+    exit 1
+  fi
+
+  local target_deployment current_color current_deployment
+  current_color="$(get_active_color)"
+  current_deployment="$(deployment_for_color "${current_color}")"
+  target_deployment="$(deployment_for_color "${color}")"
+
+  log "Waiting for ${target_deployment} to be ready before switching"
+  k rollout status deployment/"${target_deployment}" --timeout="${ROLLOUT_TIMEOUT}"
+
+  log "Switching active service ${ACTIVE_SERVICE} to ${color}"
+  k patch svc "${ACTIVE_SERVICE}" --type merge -p "{\"spec\":{\"selector\":{\"app.kubernetes.io/name\":\"${APP_NAME}\",\"track\":\"${color}\"}}}"
+
+  if [[ "${KEEP_OLD_REPLICAS}" == "0" && "${current_color}" != "${color}" ]]; then
+    log "Scaling down previous deployment ${current_deployment}"
+    k scale deployment "${current_deployment}" --replicas=0
+  fi
+
+  log "Traffic now points to ${color}"
+}
+
+cmd_rollback() {
+  local rollback_color
+  rollback_color="$(other_color "$(get_active_color)")"
+  cmd_switch --color "${rollback_color}"
+}
+
+cmd_preview_url() {
+  local color=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --color)
+        color="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "${color}" ]]; then
+    color="$(other_color "$(get_active_color)")"
+  fi
+
+  printf 'http://%s.%s.svc.cluster.local:8080\n' "$(service_for_color "${color}")" "${NAMESPACE}"
+}
+
+main() {
+  require_bin "${KUBECTL_BIN}"
+
+  local command="${1:-}"
+  shift || true
+
+  case "${command}" in
+    init)
+      cmd_init "$@"
+      ;;
+    status)
+      cmd_status "$@"
+      ;;
+    deploy)
+      cmd_deploy "$@"
+      ;;
+    switch)
+      cmd_switch "$@"
+      ;;
+    rollback)
+      cmd_rollback "$@"
+      ;;
+    preview-url)
+      cmd_preview_url "$@"
+      ;;
+    *)
+      usage
+      [[ -z "${command}" ]] || exit 1
+      ;;
+  esac
+}
+
+main "$@"
